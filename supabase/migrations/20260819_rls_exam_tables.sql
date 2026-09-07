@@ -1,6 +1,6 @@
 -- ============================================================
 -- CODE CLASH 2026 — Comprehensive RLS & Security Model
--- Phase 6 CORRECTION: Database Security & Row Level Security Hardening
+-- Phase 6 CORRECTION + Phase 11 Security Hardening
 --
 -- Status: PREPARED, NOT APPLIED (requires Supabase approval)
 --
@@ -8,8 +8,9 @@
 --   1. 20260820_add_session_duration_minutes.sql   (schema: adds column)
 --   2. 20260821_submissions_unique_constraint.sql  (schema: adds index)
 --   3. 20260822_add_violation_rpc_and_auto_submitted.sql (schema + RPC)
---   4. THIS MIGRATION (20260819)                    (RLS + SECURITY DEFINER functions)
+--   4. THIS MIGRATION (must be renamed to sort after 20260822)
 --   *** MUST be last — enables RLS on all tables ***
+--   5. 20260823_leaderboard_fix_and_assignment_enforcement.sql (overrides functions)
 --
 -- CRITICAL DESIGN PRINCIPLE:
 --   The `authenticated` role is shared between browser client and server API.
@@ -18,8 +19,46 @@
 --   exam_sessions or INSERT submissions directly — all mutations go through
 --   SECURITY DEFINER functions that verify ownership and enforce state machines.
 --
+-- SECURITY HARDENING (Phase 11):
+--   - All SECURITY DEFINER functions that accept p_user_id now verify
+--     auth.uid() = p_user_id to prevent cross-user session manipulation.
+--   - get_all_test_cases and get_question_solution are NO LONGER callable
+--     by authenticated users via direct RPC. They are restricted to
+--     service_role only. The evaluate endpoint uses a service-role client.
+--   - Data migration for existing solution_code → question_solutions included.
+--
 -- This migration is idempotent. Safe to re-run.
 -- ============================================================
+
+
+-- ============================================================================
+-- 0. DATA MIGRATION: Move solution_code from questions to question_solutions
+--
+-- Preserves existing solution_code values before the column is effectively
+-- deprecated. Idempotent: uses ON CONFLICT to avoid duplicates.
+-- ============================================================================
+
+DO $$
+BEGIN
+  -- Create question_solutions table if it doesn't exist yet
+  -- (may already exist from a prior partial run)
+  CREATE TABLE IF NOT EXISTS question_solutions (
+    question_id uuid PRIMARY KEY REFERENCES questions(id) ON DELETE CASCADE,
+    solution_code text NOT NULL,
+    created_at timestamptz DEFAULT now(),
+    updated_at timestamptz DEFAULT now()
+  );
+
+  -- Migrate existing solution_code values from questions table
+  INSERT INTO question_solutions (question_id, solution_code, created_at, updated_at)
+  SELECT id, solution_code, now(), now()
+  FROM questions
+  WHERE solution_code IS NOT NULL
+    AND solution_code != ''
+  ON CONFLICT (question_id) DO UPDATE
+  SET solution_code = EXCLUDED.solution_code,
+      updated_at = now();
+END $$;
 
 
 -- ============================================================================
@@ -95,7 +134,14 @@ CREATE POLICY "Students read own sessions"
 CREATE POLICY "Students insert own sessions"
   ON exam_sessions FOR INSERT
   TO authenticated
-  WITH CHECK (auth.uid() = user_id);
+  WITH CHECK (
+    auth.uid() = user_id
+    AND status = 'in_progress'
+    AND violation_count = 0
+    AND fullscreen_exit_count = 0
+    AND is_submitted = false
+    AND auto_submitted = false
+  );
 
 -- NO student UPDATE policy — all status transitions go through SECURITY DEFINER functions.
 -- This prevents students from forging status, violation_count, or auto_submitted fields.
@@ -259,8 +305,9 @@ CREATE POLICY "Service role full access on questions"
 --    - Students: NO access (RLS blocks all)
 --    - Admins: full access
 --    - Service role: full access
---    - The evaluate endpoint reads solution via SECURITY DEFINER function
---      (get_question_solution) which bypasses RLS.
+--    - The evaluate endpoint reads solution via get_question_solution()
+--      SECURITY DEFINER function which is restricted to service_role only.
+--      Students CANNOT call this function via browser RPC.
 -- ============================================================================
 
 CREATE TABLE IF NOT EXISTS question_solutions (
@@ -301,8 +348,9 @@ CREATE POLICY "Service role full access on question_solutions"
 --    - Hidden test cases: protected at DB level (students cannot query them)
 --    - Admins: full access
 --    - Service role: full access
---    - The evaluate endpoint reads ALL test cases via SECURITY DEFINER function
---      (get_all_test_cases) which bypasses RLS.
+--    - The evaluate endpoint reads ALL test cases via get_all_test_cases()
+--      SECURITY DEFINER function which is restricted to service_role only.
+--      Students CANNOT call this function via browser RPC.
 -- ============================================================================
 
 ALTER TABLE test_cases ENABLE ROW LEVEL SECURITY;
@@ -412,9 +460,19 @@ CREATE POLICY "Service role full access on student_assignments"
 -- These functions bypass RLS and are the ONLY way to mutate exam_sessions
 -- status, insert submissions, or read hidden test cases. They verify
 -- ownership internally and enforce state machine transitions.
+--
+-- SECURITY HARDENING (Phase 11):
+-- - Mutation functions verify auth.uid() = p_user_id to prevent
+--   cross-user session manipulation.
+-- - Read-only functions (get_all_test_cases, get_question_solution) are
+--   restricted to service_role only. Students cannot call them via RPC.
+-- - All functions use SET search_path = public to prevent search_path attacks.
 -- ============================================================================
 
+
 -- 10a. get_all_test_cases — reads ALL test cases for grading (bypasses RLS)
+-- RESTRICTED: Only callable by service_role. Students CANNOT call this via RPC.
+-- The evaluate endpoint uses a service-role client to call this function.
 CREATE OR REPLACE FUNCTION get_all_test_cases(p_question_id uuid)
 RETURNS TABLE (
   id uuid,
@@ -437,10 +495,14 @@ AS $$
   ORDER BY tc.sort_order;
 $$;
 
-GRANT EXECUTE ON FUNCTION get_all_test_cases(uuid) TO authenticated;
+-- DO NOT grant to authenticated — students must not call this via browser RPC.
+-- Only service_role has EXECUTE permission by default (function owner).
+-- The evaluate endpoint uses createServiceRoleClient() to call this.
 
 
 -- 10b. get_question_solution — reads solution_code (bypasses RLS)
+-- RESTRICTED: Only callable by service_role. Students CANNOT call this via RPC.
+-- The evaluate endpoint uses a service-role client to call this function.
 CREATE OR REPLACE FUNCTION get_question_solution(p_question_id uuid)
 RETURNS text
 LANGUAGE sql
@@ -453,11 +515,14 @@ AS $$
   WHERE qs.question_id = p_question_id;
 $$;
 
-GRANT EXECUTE ON FUNCTION get_question_solution(uuid) TO authenticated;
+-- DO NOT grant to authenticated — students must not call this via browser RPC.
+-- Only service_role has EXECUTE permission by default (function owner).
+-- The evaluate endpoint uses createServiceRoleClient() to call this.
 
 
 -- 10c. start_exam_session — transitions pending → in_progress (bypasses RLS)
--- Verifies: session belongs to caller, status is pending.
+-- Verifies: auth.uid() = p_user_id (prevents cross-user manipulation),
+--           session belongs to caller, status is pending.
 CREATE OR REPLACE FUNCTION start_exam_session(
   p_session_id uuid,
   p_user_id uuid
@@ -468,6 +533,12 @@ SECURITY DEFINER
 SET search_path = public
 AS $$
 BEGIN
+  -- Verify caller is the authenticated user (prevents service-role or
+  -- cross-user calls from manipulating sessions)
+  IF auth.uid() IS NULL OR auth.uid() != p_user_id THEN
+    RAISE EXCEPTION 'Access denied: caller identity mismatch';
+  END IF;
+
   RETURN QUERY
   UPDATE exam_sessions
   SET status = 'in_progress'
@@ -482,7 +553,8 @@ GRANT EXECUTE ON FUNCTION start_exam_session(uuid, uuid) TO authenticated;
 
 
 -- 10d. complete_exam_session — transitions in_progress → completed (bypasses RLS)
--- Verifies: session belongs to caller, status is in_progress.
+-- Verifies: auth.uid() = p_user_id (prevents cross-user manipulation),
+--           session belongs to caller, status is in_progress.
 -- Sets: status = completed, submitted_at = now(), is_submitted = true.
 -- Optional: auto_submitted flag for anti-cheat auto-submits.
 CREATE OR REPLACE FUNCTION complete_exam_session(
@@ -496,6 +568,11 @@ SECURITY DEFINER
 SET search_path = public
 AS $$
 BEGIN
+  -- Verify caller is the authenticated user
+  IF auth.uid() IS NULL OR auth.uid() != p_user_id THEN
+    RAISE EXCEPTION 'Access denied: caller identity mismatch';
+  END IF;
+
   RETURN QUERY
   UPDATE exam_sessions
   SET status = 'completed',
@@ -513,7 +590,8 @@ GRANT EXECUTE ON FUNCTION complete_exam_session(uuid, uuid, boolean) TO authenti
 
 
 -- 10e. insert_submission — inserts a graded submission (bypasses RLS)
--- Verifies: session belongs to caller, session is in_progress.
+-- Verifies: auth.uid() = p_user_id (prevents cross-user submissions),
+--           session belongs to caller, session is in_progress.
 -- Returns the inserted row.
 CREATE OR REPLACE FUNCTION insert_submission(
   p_user_id uuid,
@@ -537,6 +615,11 @@ DECLARE
   v_session_owner uuid;
   v_session_status text;
 BEGIN
+  -- Verify caller is the authenticated user
+  IF auth.uid() IS NULL OR auth.uid() != p_user_id THEN
+    RAISE EXCEPTION 'Access denied: caller identity mismatch';
+  END IF;
+
   -- Verify session ownership and status
   SELECT user_id, status INTO v_session_owner, v_session_status
   FROM exam_sessions WHERE id = p_exam_session_id;
@@ -580,6 +663,9 @@ GRANT EXECUTE ON FUNCTION insert_submission(
 -- The leaderboard API needs to read ALL students' exam_sessions, submissions,
 -- and profiles. Under RLS, the authenticated role can only read own data.
 -- This SECURITY DEFINER function bypasses RLS to aggregate leaderboard data.
+--
+-- No p_user_id parameter — returns aggregate data for all students.
+-- No auth.uid() check needed — leaderboard is public to all authenticated users.
 -- ============================================================================
 
 CREATE OR REPLACE FUNCTION get_leaderboard_data(exam_number_param integer)
@@ -651,30 +737,44 @@ GRANT EXECUTE ON FUNCTION get_leaderboard_data(integer) TO authenticated;
 -- HIDDEN DATA PROTECTION (solution_code):
 -- solution_code is stored in a separate `question_solutions` table.
 -- No student SELECT policy on question_solutions = students cannot read it.
--- The evaluate endpoint reads it via get_question_solution() SECURITY DEFINER.
--- Admin pages read it via admin ALL policy.
--- A student using the browser console CANNOT query solution_code.
+-- get_question_solution() is NOT granted to authenticated — students cannot
+-- call it via browser RPC. Only service_role can call it.
+-- The evaluate endpoint uses a service-role client to read solutions.
+-- Admin pages read via admin ALL policy.
 --
 -- HIDDEN DATA PROTECTION (test_cases):
 -- Hidden test cases (is_sample = false) are protected at DB level.
 -- Student SELECT policy only allows is_sample = true.
--- A student using the browser console CANNOT query hidden test cases.
--- The evaluate endpoint reads ALL test cases via get_all_test_cases()
--- SECURITY DEFINER function.
+-- get_all_test_cases() is NOT granted to authenticated — students cannot
+-- call it via browser RPC. Only service_role can call it.
+-- The evaluate endpoint uses a service-role client to read all test cases.
 --
 -- EXAM_SESSIONS STATUS:
 -- Students CANNOT update exam_sessions directly (no UPDATE policy).
 -- All status transitions go through SECURITY DEFINER functions:
---   - start_exam_session: pending → in_progress (verifies ownership)
---   - complete_exam_session: in_progress → completed (verifies ownership)
+--   - start_exam_session: pending → in_progress (verifies auth.uid() = p_user_id)
+--   - complete_exam_session: in_progress → completed (verifies auth.uid() = p_user_id)
 --   - increment_violation_count: increments violation_count (verifies ownership)
 -- A student cannot forge status, violation_count, or auto_submitted.
+--
+-- EXAM_SESSIONS INSERT:
+-- Students can INSERT own sessions (auth.uid() = user_id).
+-- WITH CHECK restricts initial values: status must be 'in_progress',
+-- violation_count = 0, fullscreen_exit_count = 0, is_submitted = false,
+-- auto_submitted = false. Students cannot create pre-completed or
+-- pre-violated sessions.
 --
 -- SUBMISSIONS SCORES:
 -- Students CANNOT insert or update submissions directly (no INSERT/UPDATE policy).
 -- All submission inserts go through insert_submission() SECURITY DEFINER function
--- which verifies session ownership and status.
+-- which verifies auth.uid() = p_user_id AND session ownership AND status.
 -- A student cannot forge scores at the database level.
+--
+-- CROSS-USER PROTECTION:
+-- All mutation functions (start_exam_session, complete_exam_session,
+-- insert_submission) verify auth.uid() = p_user_id. Even if a student
+-- obtains another user's session ID, they cannot manipulate it because
+-- auth.uid() (from their JWT) will not match.
 --
 -- VIOLATIONS SESSION OWNERSHIP:
 -- The violations INSERT policy verifies the session belongs to the user.
@@ -683,6 +783,11 @@ GRANT EXECUTE ON FUNCTION get_leaderboard_data(integer) TO authenticated;
 -- LEADERBOARD:
 -- Uses SECURITY DEFINER function to read all students' data.
 -- The function returns only non-sensitive columns (no code, no IP, no user-agent).
+--
+-- SEARCH_PATH SAFETY:
+-- All SECURITY DEFINER functions use SET search_path = public.
+-- This prevents search_path manipulation attacks where an attacker
+-- creates objects in a malicious schema to hijack function execution.
 --
 -- RATE LIMITING:
 -- The in-memory rate limit map in violations API resets on serverless cold start.
@@ -694,6 +799,6 @@ GRANT EXECUTE ON FUNCTION get_leaderboard_data(integer) TO authenticated;
 -- Applying RLS before schema changes could cause errors.
 --
 -- DEPENDENCY GRAPH:
---   20260820 → 20260821 → 20260822 → 20260819 (this file)
+--   20260820 → 20260821 → 20260822 → THIS FILE → 20260823
 --   Each arrow means "must be applied before".
 -- ============================================================================

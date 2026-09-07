@@ -1,4 +1,5 @@
 import { createServerClient } from "@supabase/ssr";
+import { createClient as createSupabaseClient } from "@supabase/supabase-js";
 import { cookies } from "next/headers";
 import { NextResponse } from "next/server";
 
@@ -22,6 +23,28 @@ export async function createClient() {
           // Ignore errors in Server Components (read-only)
         }
       },
+    },
+  });
+}
+
+/**
+ * Create a Supabase client with the service_role key.
+ * Bypasses RLS — use ONLY for server-side operations that need elevated access
+ * (e.g., calling SECURITY DEFINER functions that are restricted to service_role).
+ * NEVER expose this client to the browser.
+ */
+export function createServiceRoleClient() {
+  const supabaseUrl = process.env.NEXT_PUBLIC_SUPABASE_URL;
+  const serviceRoleKey = process.env.SUPABASE_SERVICE_ROLE_KEY;
+
+  if (!supabaseUrl || !serviceRoleKey) {
+    throw new Error("SUPABASE_SERVICE_ROLE_KEY is required for service-role operations");
+  }
+
+  return createSupabaseClient(supabaseUrl, serviceRoleKey, {
+    auth: {
+      autoRefreshToken: false,
+      persistSession: false,
     },
   });
 }

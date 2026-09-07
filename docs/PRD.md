@@ -1268,14 +1268,60 @@ Database protections (requires live Supabase):
 - `.env.example` — added E2E test variable placeholders
 - `docs/PRD.md` — added Phase 11 section (this section)
 
+### 5.19 Phase 11 Security Hardening — Migration & Function Audit (complete)
+
+**Issues found and fixed:**
+
+| # | Issue | Severity | Fix |
+|---|---|---|---|
+| 1 | `get_all_test_cases()` granted EXECUTE to `authenticated` — students could call via browser RPC to read hidden test cases | **CRITICAL** | Removed GRANT. Now service_role only. Evaluate endpoint uses `createServiceRoleClient()`. |
+| 2 | `get_question_solution()` granted EXECUTE to `authenticated` — students could call via browser RPC to read solution_code | **CRITICAL** | Removed GRANT. Now service_role only. Evaluate endpoint uses `createServiceRoleClient()`. |
+| 3 | `start_exam_session()` trusted caller-supplied `p_user_id` without verifying `auth.uid()` — cross-user session manipulation possible | **HIGH** | Added `IF auth.uid() != p_user_id THEN RAISE EXCEPTION` check. |
+| 4 | `complete_exam_session()` trusted caller-supplied `p_user_id` without verifying `auth.uid()` — cross-user session completion possible | **HIGH** | Added `IF auth.uid() != p_user_id THEN RAISE EXCEPTION` check. |
+| 5 | `insert_submission()` trusted caller-supplied `p_user_id` without verifying `auth.uid()` — cross-user submission forgery possible | **HIGH** | Added `IF auth.uid() != p_user_id THEN RAISE EXCEPTION` check. |
+| 6 | No idempotent data migration for existing `questions.solution_code` → `question_solutions` | MEDIUM | Added `INSERT ... ON CONFLICT DO UPDATE` migration in the SQL file. |
+| 7 | `exam_sessions` INSERT policy had no WITH CHECK — students could create sessions with pre-set status/violation fields | MEDIUM | Added WITH CHECK: `status = 'in_progress' AND violation_count = 0 AND auto_submitted = false`. |
+| 8 | Migration filename `20260819` sorts before dependencies `20260820-20260822` | HIGH | Documented: must rename to `20260824_rls_exam_tables.sql` before applying. |
+| 9 | `increment_violation_count()` (in 20260822) trusted caller-supplied `p_user_id` without verifying `auth.uid()` | HIGH | **Requires separate fix in 20260822 migration** — add `IF auth.uid() != p_user_id` check. |
+
+**Files changed:**
+- `supabase/migrations/20260819_rls_exam_tables.sql` — complete rewrite with security hardening
+- `src/lib/supabase/server.ts` — added `createServiceRoleClient()` factory
+- `src/app/api/submissions/evaluate/route.ts` — uses service-role client for `get_all_test_cases` RPC
+
+**Security model after fix:**
+
+| Function | Caller Verification | Access Control |
+|---|---|---|
+| `get_all_test_cases()` | None needed (no user data) | **service_role only** (no GRANT to authenticated) |
+| `get_question_solution()` | None needed (no user data) | **service_role only** (no GRANT to authenticated) |
+| `start_exam_session()` | `auth.uid() = p_user_id` | GRANT to authenticated |
+| `complete_exam_session()` | `auth.uid() = p_user_id` | GRANT to authenticated |
+| `insert_submission()` | `auth.uid() = p_user_id` | GRANT to authenticated |
+| `increment_violation_count()` | `v_owner = p_user_id` (in 20260822) | GRANT to authenticated |
+| `get_leaderboard_data()` | None (aggregate data) | GRANT to authenticated |
+
+**Solution data migration behavior:**
+- Idempotent: `INSERT INTO question_solutions ... ON CONFLICT (question_id) DO UPDATE`
+- Preserves all existing `questions.solution_code` values (3 questions)
+- Safe to re-run: existing rows are updated, not duplicated
+- Runs inside `DO $$ ... BEGIN ... END $$` block for safety
+
+**Verification results:**
+- `npx tsc --noEmit` — clean (0 errors)
+- `npm run lint` — 14 pre-existing issues (3 errors, 11 warnings), 0 new from security hardening
+- `npm run build` — clean (21 routes + proxy)
+- `npm test` — 190 tests, all passing
+
 **Remaining risks:**
-1. Public Piston API capacity for 100-200 concurrent students is unverified
-2. Vercel free tier concurrency limit (10 concurrent serverless executions)
-3. In-memory rate limiter resets on serverless cold start
-4. `20260819_rls_exam_tables.sql` must be renamed before applying
-5. Realtime publications must be enabled in Supabase dashboard
-6. Google OAuth must be configured in Google Cloud Console + Supabase dashboard
-7. Admin account must be created and role updated via SQL after signup
-8. Questions/test cases must be seeded before competition
-9. Browser anti-cheat behavior not verified in production
-10. 35 E2E tests require credentials to run
+1. `increment_violation_count()` in `20260822` still needs `auth.uid()` verification (separate migration file)
+2. Migration filename must be renamed before applying (documented)
+3. Public Piston API capacity for 100-200 concurrent students is unverified
+4. Vercel free tier concurrency limit (10 concurrent serverless executions)
+5. In-memory rate limiter resets on serverless cold start
+6. Realtime publications must be enabled in Supabase dashboard
+7. Google OAuth must be configured in Google Cloud Console + Supabase dashboard
+8. Admin account must be created and role updated via SQL after signup
+9. Questions/test cases must be seeded before competition
+10. Browser anti-cheat behavior not verified in production
+11. 35 E2E tests require credentials to run

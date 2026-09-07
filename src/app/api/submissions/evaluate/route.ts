@@ -1,4 +1,4 @@
-import { getAuthUser, getSettings, isSessionExpired } from "@/lib/supabase/server";
+import { getAuthUser, getSettings, isSessionExpired, createServiceRoleClient } from "@/lib/supabase/server";
 import {
   MAX_SOURCE_CODE_BYTES,
   getSourceCodeSizeBytes,
@@ -121,7 +121,9 @@ export async function POST(request: Request) {
       );
     }
 
-    const { data: testCases, error: tcError } = await supabase
+    // Use service-role client for get_all_test_cases (restricted to service_role only)
+    const serviceClient = createServiceRoleClient();
+    const { data: testCases, error: tcError } = await serviceClient
       .rpc("get_all_test_cases", { p_question_id: question_id });
 
     if (tcError) {
