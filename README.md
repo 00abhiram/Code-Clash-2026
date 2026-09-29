@@ -373,12 +373,14 @@ Client-side fullscreen/background monitoring provides deterrence, while server-s
 ## 👨‍💻 Author
 
 **Abhiram Reddy**
+**Akshay Vardhan**
 
 - GitHub: [github.com/00abhiram](https://github.com/00abhiram)
+- Github: [github.com/akshayvardhan2023]_(https://github.com/akshayvardhan2023).
 - Project: Code Clash 2026 — Pallavi Engineering College
 
 ---
 
 ## 📄 License
 
-All rights reserved To Abhi Ram Reddy.
+All rights reserved To Abhi Ram Reddy,Akshay Vardhan..
